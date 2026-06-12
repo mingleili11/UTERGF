@@ -13,9 +13,15 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
-# 配置 
 class Config:
-    data_path = "1.csv"
+    data_dir = "故障数据"
+    data_files = [
+        ("itsc_0", "17.csv"),
+        ("itsc_1", "1.csv"),
+        ("itsc_2", "1.csv"),
+        ("itsc_3", "1.csv"),
+    ]
+    num_classes = 4
     seq_len = 1800
     timesteps = 1000
     epochs = 5000
@@ -24,12 +30,15 @@ class Config:
     hidden_dim = 128
     ch_mults = (1, 2, 4, 8)
     time_dim = 256
+    class_dim = 128
     ema_decay = 0.9999
-    save_dir = "checkpoints"
+    save_dir = "checkpoints_fault"
     beta_start = 1e-4
     beta_end = 0.02
     num_workers = 4
     compile_model = True
+    # cfg_dropout_prob: 训练时以此概率丢弃类别标签, 用于 classifier-free guidance
+    cfg_dropout_prob = 0.1
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -51,7 +60,6 @@ def get_noise_schedule(timesteps, beta_start, beta_end):
     }
 
 
-# 时间步嵌入 
 class SinusoidalTimeEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -65,16 +73,15 @@ class SinusoidalTimeEmbedding(nn.Module):
         return torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
 
 
-# 1D ResBlock 
 class ResBlock1D(nn.Module):
-    def __init__(self, in_ch, out_ch, time_dim):
+    def __init__(self, in_ch, out_ch, cond_dim):
         super().__init__()
         self.conv1 = nn.Sequential(
             nn.GroupNorm(8, in_ch),
             nn.SiLU(),
             nn.Conv1d(in_ch, out_ch, 3, padding=1),
         )
-        self.time_mlp = nn.Sequential(nn.SiLU(), nn.Linear(time_dim, out_ch))
+        self.cond_mlp = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, out_ch))
         self.conv2 = nn.Sequential(
             nn.GroupNorm(8, out_ch),
             nn.SiLU(),
@@ -82,23 +89,28 @@ class ResBlock1D(nn.Module):
         )
         self.shortcut = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x, t_emb):
+    def forward(self, x, cond):
         h = self.conv1(x)
-        h = h + self.time_mlp(t_emb).unsqueeze(-1)
+        h = h + self.cond_mlp(cond).unsqueeze(-1)
         h = self.conv2(h)
         return h + self.shortcut(x)
 
 
-# 1D U-Net 
 class UNet1D(nn.Module):
-    def __init__(self, in_ch=1, base_ch=128, ch_mults=(1, 2, 4, 8), time_dim=256):
+    def __init__(self, in_ch=1, base_ch=128, ch_mults=(1, 2, 4, 8),
+                 time_dim=256, num_classes=4, class_dim=128):
         super().__init__()
+        cond_dim = time_dim + class_dim
+
         self.time_embed = nn.Sequential(
             SinusoidalTimeEmbedding(time_dim),
             nn.Linear(time_dim, time_dim),
             nn.SiLU(),
             nn.Linear(time_dim, time_dim),
         )
+        # num_classes + 1: 额外一个 embedding 用于无条件 (null class)
+        self.class_embed = nn.Embedding(num_classes + 1, class_dim)
+
         self.input_conv = nn.Conv1d(in_ch, base_ch, 3, padding=1)
         channels = [base_ch * m for m in ch_mults]
 
@@ -107,14 +119,14 @@ class UNet1D(nn.Module):
         prev_ch = base_ch
         for ch in channels:
             self.down_blocks.append(nn.ModuleList([
-                ResBlock1D(prev_ch, ch, time_dim),
-                ResBlock1D(ch, ch, time_dim),
+                ResBlock1D(prev_ch, ch, cond_dim),
+                ResBlock1D(ch, ch, cond_dim),
             ]))
             self.down_samples.append(nn.Conv1d(ch, ch, 4, stride=2, padding=1))
             prev_ch = ch
 
-        self.mid_block1 = ResBlock1D(channels[-1], channels[-1], time_dim)
-        self.mid_block2 = ResBlock1D(channels[-1], channels[-1], time_dim)
+        self.mid_block1 = ResBlock1D(channels[-1], channels[-1], cond_dim)
+        self.mid_block2 = ResBlock1D(channels[-1], channels[-1], cond_dim)
 
         self.up_blocks = nn.ModuleList()
         self.up_samples = nn.ModuleList()
@@ -122,8 +134,8 @@ class UNet1D(nn.Module):
             out_ch = channels[-(i + 2)] if i < len(channels) - 1 else base_ch
             self.up_samples.append(nn.ConvTranspose1d(ch, ch, 4, stride=2, padding=1))
             self.up_blocks.append(nn.ModuleList([
-                ResBlock1D(ch * 2, out_ch, time_dim),
-                ResBlock1D(out_ch, out_ch, time_dim),
+                ResBlock1D(ch * 2, out_ch, cond_dim),
+                ResBlock1D(out_ch, out_ch, cond_dim),
             ]))
 
         self.out_conv = nn.Sequential(
@@ -132,19 +144,22 @@ class UNet1D(nn.Module):
             nn.Conv1d(base_ch, in_ch, 1),
         )
 
-    def forward(self, x, t):
+    def forward(self, x, t, class_label):
         t_emb = self.time_embed(t)
+        c_emb = self.class_embed(class_label)
+        cond = torch.cat([t_emb, c_emb], dim=1)
+
         x = self.input_conv(x)
 
         skips = []
         for (res1, res2), down in zip(self.down_blocks, self.down_samples):
-            x = res1(x, t_emb)
-            x = res2(x, t_emb)
+            x = res1(x, cond)
+            x = res2(x, cond)
             skips.append(x)
             x = down(x)
 
-        x = self.mid_block1(x, t_emb)
-        x = self.mid_block2(x, t_emb)
+        x = self.mid_block1(x, cond)
+        x = self.mid_block2(x, cond)
 
         for (res1, res2), up in zip(self.up_blocks, self.up_samples):
             x = up(x)
@@ -152,13 +167,12 @@ class UNet1D(nn.Module):
             if x.shape[-1] != skip.shape[-1]:
                 x = F.pad(x, (0, skip.shape[-1] - x.shape[-1]))
             x = torch.cat([x, skip], dim=1)
-            x = res1(x, t_emb)
-            x = res2(x, t_emb)
+            x = res1(x, cond)
+            x = res2(x, cond)
 
         return self.out_conv(x)
 
 
-# EMA 
 class EMA:
     def __init__(self, model, decay=0.9999):
         self.decay = decay
@@ -176,10 +190,11 @@ class EMA:
         return self.shadow.state_dict()
 
 
-# 数据集 
-class SignalDataset(Dataset):
-    def __init__(self, signal, seq_len, augment=True):
-        self.signal = signal
+class FaultSignalDataset(Dataset):
+    """多类别故障信号数据集, 每次随机选一个类别返回对应信号"""
+    def __init__(self, signals, seq_len, augment=True):
+        self.signals = signals  # list of tensors, shape (1, seq_len) each
+        self.num_classes = len(signals)
         self.seq_len = seq_len
         self.augment = augment
 
@@ -187,65 +202,110 @@ class SignalDataset(Dataset):
         return 2048
 
     def __getitem__(self, idx):
-        x = self.signal.clone()
+        cls = idx % self.num_classes
+        x = self.signals[cls].clone()
         if self.augment:
             noise_scale = torch.rand(1).item() * 0.002
             x = x + torch.randn_like(x) * noise_scale
-        return x
+        return x, cls
 
 
-# DDP 工具 
+def _is_distributed():
+    return "LOCAL_RANK" in os.environ
+
+
 def setup_ddp():
-    backend = "nccl" if os.name != "nt" else "gloo"
-    dist.init_process_group(backend=backend)
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    return local_rank
+    if _is_distributed():
+        backend = "nccl" if os.name != "nt" else "gloo"
+        dist.init_process_group(backend=backend)
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        return local_rank
+    else:
+        torch.cuda.set_device(0)
+        return 0
 
 
 def cleanup_ddp():
-    dist.destroy_process_group()
+    if _is_distributed():
+        dist.destroy_process_group()
 
 
 def is_main_process():
     return int(os.environ.get("LOCAL_RANK", 0)) == 0
 
 
-# 训练 
+def load_all_signals(cfg):
+    """加载四段故障数据, 统一归一化"""
+    raw_signals = []
+    for subdir, fname in cfg.data_files:
+        path = os.path.join(cfg.data_dir, subdir, fname)
+        raw = np.loadtxt(path, delimiter=",").flatten()
+        raw_signals.append(raw)
+
+    all_concat = np.concatenate(raw_signals)
+    data_mean = all_concat.mean()
+    data_std = all_concat.std()
+
+    signals = []
+    orig_lens = []
+    for i, raw in enumerate(raw_signals):
+        normalized = (raw - data_mean) / data_std
+        padded = np.zeros(cfg.seq_len)
+        padded[:len(normalized)] = normalized
+        signal = torch.tensor(padded, dtype=torch.float32).unsqueeze(0)
+        signals.append(signal)
+        orig_lens.append(len(raw))
+
+        if is_main_process():
+            print(f"  [{cfg.data_files[i][0]}] 长度={len(raw)}, "
+                  f"原始范围=[{raw.min():.6f}, {raw.max():.6f}]")
+
+    if is_main_process():
+        print(f"全局归一化: 均值={data_mean:.6f}, 标准差={data_std:.6f}")
+
+    return signals, data_mean, data_std, orig_lens
+
+
 def train():
     cfg = Config()
     local_rank = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
-    world_size = dist.get_world_size()
+    world_size = dist.get_world_size() if _is_distributed() else 1
+
+    os.makedirs(cfg.save_dir, exist_ok=True)
+    if _is_distributed():
+        dist.barrier()
 
     if is_main_process():
-        os.makedirs(cfg.save_dir, exist_ok=True)
-    dist.barrier()
+        print(f"加载 {cfg.num_classes} 段故障数据...")
 
-    raw = np.loadtxt(cfg.data_path, delimiter=",").flatten()
-    data_mean = raw.mean()
-    data_std = raw.std()
-    normalized = (raw - data_mean) / data_std
-    if is_main_process():
-        print(f"原始数据: 长度={len(raw)}, 均值={data_mean:.6f}, 标准差={data_std:.6f}")
-
-    padded = np.zeros(cfg.seq_len)
-    padded[:len(normalized)] = normalized
-    signal = torch.tensor(padded, dtype=torch.float32).unsqueeze(0)
+    signals, data_mean, data_std, orig_lens = load_all_signals(cfg)
 
     if is_main_process():
-        np.savez(os.path.join(cfg.save_dir, "norm_params.npz"),
-                 mean=data_mean, std=data_std, orig_len=len(raw))
+        np.savez(
+            os.path.join(cfg.save_dir, "norm_params.npz"),
+            mean=data_mean, std=data_std,
+            orig_lens=np.array(orig_lens),
+            num_classes=cfg.num_classes,
+        )
 
-    dataset = SignalDataset(signal, cfg.seq_len)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
+    dataset = FaultSignalDataset(signals, cfg.seq_len)
+    if _is_distributed():
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=local_rank, shuffle=True)
+    else:
+        sampler = None
     loader = DataLoader(
-        dataset, batch_size=cfg.batch_size, sampler=sampler,
+        dataset, batch_size=cfg.batch_size,
+        sampler=sampler, shuffle=(sampler is None),
         num_workers=cfg.num_workers, pin_memory=True,
         persistent_workers=True, drop_last=True,
     )
 
-    raw_model = UNet1D(in_ch=1, base_ch=cfg.hidden_dim, ch_mults=cfg.ch_mults, time_dim=cfg.time_dim).to(device)
+    raw_model = UNet1D(
+        in_ch=1, base_ch=cfg.hidden_dim, ch_mults=cfg.ch_mults,
+        time_dim=cfg.time_dim, num_classes=cfg.num_classes, class_dim=cfg.class_dim,
+    ).to(device)
 
     if is_main_process():
         ema = EMA(raw_model, decay=cfg.ema_decay)
@@ -254,7 +314,10 @@ def train():
 
     if cfg.compile_model and hasattr(torch, "compile"):
         raw_model = torch.compile(raw_model)
-    model = DDP(raw_model, device_ids=[local_rank])
+    if _is_distributed():
+        model = DDP(raw_model, device_ids=[local_rank])
+    else:
+        model = raw_model
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=1e-6)
@@ -263,29 +326,37 @@ def train():
     for k, v in noise_sched.items():
         noise_sched[k] = v.to(device)
 
+    null_class = cfg.num_classes  # index for unconditional
+
     if is_main_process():
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"模型参数量: {param_count:,}")
         print(f"GPU: {world_size} | batch/gpu: {cfg.batch_size} | effective batch: {cfg.batch_size * world_size}")
-        print(f"FP32 全精度训练 | torch.compile: {cfg.compile_model} | EMA decay: {cfg.ema_decay}")  # <-- 修改 1
+        print(f"BF16 (bfloat16) | torch.compile: {cfg.compile_model} | EMA decay: {cfg.ema_decay}")
+        print(f"类别数: {cfg.num_classes} | CFG dropout: {cfg.cfg_dropout_prob}")
         print(f"cosine noise schedule | ch_mults: {cfg.ch_mults}")
         print(f"开始训练 {cfg.epochs} 轮...")
 
     best_loss = float("inf")
     loss_history = []
+    class_loss_history = {i: [] for i in range(cfg.num_classes)}
 
     epoch_iter = range(1, cfg.epochs + 1)
     if is_main_process():
         epoch_iter = tqdm(epoch_iter, desc="Training", unit="epoch", ncols=120)
 
     for epoch in epoch_iter:
-        sampler.set_epoch(epoch)
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         model.train()
         epoch_loss = 0.0
         count = 0
+        class_epoch_loss = {i: 0.0 for i in range(cfg.num_classes)}
+        class_count = {i: 0 for i in range(cfg.num_classes)}
 
-        for batch in loader:
-            x0 = batch.to(device, non_blocking=True)
+        for x0, cls_labels in loader:
+            x0 = x0.to(device, non_blocking=True)
+            cls_labels = cls_labels.to(device, non_blocking=True)
             B = x0.shape[0]
             t = torch.randint(0, cfg.timesteps, (B,), device=device)
             noise = torch.randn_like(x0)
@@ -294,11 +365,17 @@ def train():
             sqrt_one_minus = noise_sched["sqrt_one_minus_alphas_cumprod"][t].view(B, 1, 1)
             x_noisy = sqrt_alpha * x0 + sqrt_one_minus * noise
 
-            # ====================== 修改 2：删掉自动混合精度，纯 FP32 ======================
-            # 原来：with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            # 现在：直接去掉，使用默认 FP32
-            pred_noise = model(x_noisy, t)
+            # classifier-free guidance: 随机丢弃类别标签
+            drop_mask = torch.rand(B, device=device) < cfg.cfg_dropout_prob
+            cond_labels = cls_labels.clone()
+            cond_labels[drop_mask] = null_class
+
+            #with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            pred_noise = model(x_noisy, t, cond_labels)
             loss = F.mse_loss(pred_noise, noise)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -311,17 +388,29 @@ def train():
             epoch_loss += loss.item() * B
             count += B
 
+            for ci in range(cfg.num_classes):
+                mask = cls_labels == ci
+                if mask.any():
+                    class_epoch_loss[ci] += loss.item() * mask.sum().item()
+                    class_count[ci] += mask.sum().item()
+
         scheduler.step()
-        avg_loss = epoch_loss / count
+        avg_loss = epoch_loss / count if count > 0 else float("nan")
 
         if is_main_process():
             loss_history.append(avg_loss)
+            for ci in range(cfg.num_classes):
+                if class_count[ci] > 0:
+                    class_loss_history[ci].append(class_epoch_loss[ci] / class_count[ci])
 
-            if avg_loss < best_loss:
+            if not math.isnan(avg_loss) and avg_loss < best_loss:
                 best_loss = avg_loss
-                torch.save(ema.state_dict(), os.path.join(cfg.save_dir, "best_model.pt"))
+                #torch.save(ema.state_dict(), os.path.join(cfg.save_dir, "best_model.pt"))
 
-            epoch_iter.set_postfix(loss=f"{avg_loss:.6f}", best=f"{best_loss:.6f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+            epoch_iter.set_postfix(
+                loss=f"{avg_loss:.6f}", best=f"{best_loss:.6f}",
+                lr=f"{scheduler.get_last_lr()[0]:.2e}",
+            )
 
             if epoch % 1000 == 0:
                 torch.save(ema.state_dict(), os.path.join(cfg.save_dir, f"model_epoch_{epoch}.pt"))
@@ -329,13 +418,26 @@ def train():
     if is_main_process():
         torch.save(ema.state_dict(), os.path.join(cfg.save_dir, "final_model.pt"))
 
-        plt.figure(figsize=(10, 4))
-        plt.plot(loss_history)
-        plt.xlabel("Epoch")
-        plt.ylabel("MSE Loss")
-        plt.title("Training Loss")
-        plt.yscale("log")
-        plt.grid(True, alpha=0.3)
+        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+        axes[0].plot(loss_history)
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("MSE Loss")
+        axes[0].set_title("Total Training Loss")
+        axes[0].set_yscale("log")
+        axes[0].grid(True, alpha=0.3)
+
+        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+        for ci in range(cfg.num_classes):
+            if class_loss_history[ci]:
+                axes[1].plot(class_loss_history[ci], label=f"itsc_{ci}", color=colors[ci])
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("MSE Loss")
+        axes[1].set_title("Per-Class Training Loss")
+        axes[1].set_yscale("log")
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
         plt.tight_layout()
         plt.savefig(os.path.join(cfg.save_dir, "loss_curve.png"), dpi=150)
         plt.close()
